@@ -11,6 +11,7 @@ from mlagents.trainers.behavior_id_utils import BehaviorIdentifiers
 from mlagents_envs.base_env import BehaviorSpec
 from mlagents.trainers.settings import TrainerSettings
 from .dqn_optimizer import DQNOptimizer, DQNSettings, QNetwork
+from mlagents.trainers.policy import Policy
 
 logger = get_logger(__name__)
 TRAINER_NAME = "dqn"
@@ -146,6 +147,14 @@ class DQNTrainer(OffPolicyTrainer):
         )
         self.maybe_load_replay_buffer()
         return policy
+
+    def get_policy(self, name_behavior_id: str) -> Policy:
+        """
+        Gets policy associated with name_behavior_id
+        :param name_behavior_id: Fully qualified behavior name
+        :return: Policy associated with name_behavior_id
+        """
+        return self.policy
 
     @staticmethod
     def get_settings_type():

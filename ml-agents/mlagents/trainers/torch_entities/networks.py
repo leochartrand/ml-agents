@@ -21,6 +21,10 @@ from mlagents.trainers.torch_entities.attention import (
 )
 from mlagents.trainers.exception import UnityTrainerException
 
+from mlagents_envs.logging_util import get_logger
+
+logger = get_logger(__name__)
+
 
 ActivationFunction = Callable[[torch.Tensor], torch.Tensor]
 EncoderFunction = Callable[
@@ -449,6 +453,69 @@ class Critic(abc.ABC):
         """
         pass
 
+class BranchValueNetwork(nn.Module, Critic):
+    def __init__(
+        self,
+        stream_names: List[str],
+        observation_specs: List[ObservationSpec],
+        network_settings: NetworkSettings,
+        encoded_act_size: int = 0,
+        outputs_per_stream: Tuple[int, ...] = 1,
+    ):
+
+        # This is not a typo, we want to call __init__ of nn.Module
+        nn.Module.__init__(self)
+        self.network_body = NetworkBody(
+            observation_specs, network_settings, encoded_act_size=encoded_act_size
+        )
+        if network_settings.memory is not None:
+            encoding_size = network_settings.memory.memory_size // 2
+        else:
+            encoding_size = network_settings.hidden_units
+        # self.value_heads = ValueHeads(stream_names, encoding_size, outputs_per_stream)
+        self.value_heads = [ValueHeads(stream_names, encoding_size, branch_size) for branch_size in outputs_per_stream]
+
+        logger.debug(f"Value heads: {self.value_heads}")
+        self.stream_names = stream_names
+
+    def update_normalization(self, buffer: AgentBuffer) -> None:
+        self.network_body.update_normalization(buffer)
+
+    @property
+    def memory_size(self) -> int:
+        return self.network_body.memory_size
+
+    def critic_pass(
+        self,
+        inputs: List[torch.Tensor],
+        memories: Optional[torch.Tensor] = None,
+        sequence_length: int = 1,
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        value_outputs, critic_mem_out = self.forward(
+            inputs, memories=memories, sequence_length=sequence_length
+        )
+        return value_outputs, critic_mem_out
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        actions: Optional[torch.Tensor] = None,
+        memories: Optional[torch.Tensor] = None,
+        sequence_length: int = 1,
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        encoding, memories = self.network_body(
+            inputs, actions, memories, sequence_length
+        )
+        temp : Dict[str, List] = {}
+        output = {}
+        for stream in self.stream_names:
+            temp[stream] = []
+            for value_head in self.value_heads:
+                temp[stream].append(value_head(encoding)[stream])
+        for stream in self.stream_names:
+            output[stream] = torch.stack(temp[stream], dim=2)
+        return output, memories
+
 
 class ValueNetwork(nn.Module, Critic):
     def __init__(
@@ -765,3 +832,4 @@ class LearningRate(nn.Module):
         # Todo: add learning rate decay
         super().__init__()
         self.learning_rate = torch.Tensor([lr])
+

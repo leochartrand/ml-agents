@@ -1,11 +1,12 @@
 from typing import cast
+from mlagents_envs.logging_util import get_logger
 from mlagents.torch_utils import torch, nn, default_device
 from mlagents.trainers.optimizer.torch_optimizer import TorchOptimizer
 from mlagents.trainers.policy.torch_policy import TorchPolicy
 from mlagents.trainers.buffer import AgentBuffer, BufferKey, RewardSignalUtil
 from mlagents_envs.timers import timed
 from typing import List, Dict, Tuple, Optional, Union, Any
-from mlagents.trainers.torch_entities.networks import ValueNetwork, Actor
+from mlagents.trainers.torch_entities.networks import ValueNetwork, Actor, BranchValueNetwork
 from mlagents_envs.base_env import ActionSpec, ObservationSpec
 from mlagents.trainers.torch_entities.agent_action import AgentAction
 from mlagents.trainers.torch_entities.utils import ModelUtils
@@ -17,7 +18,7 @@ from mlagents.trainers.torch_entities.networks import Critic
 import numpy as np
 import attr
 
-
+logger = get_logger(__name__)
 # TODO: fix saving to onnx
 
 
@@ -131,17 +132,18 @@ class DQNOptimizer(TorchOptimizer):
         for name_i, name in enumerate(rewards.keys()):
             with torch.no_grad():
                 next_q_values = torch.gather(
-                    next_q_values_list[name], dim=1, index=greedy_actions
+                    next_q_values_list[name], dim=1, index=torch.stack(greedy_actions, dim=2)
                 ).squeeze()
                 target_q_values = rewards[name] + (
                     (1.0 - self.use_dones_in_backup[name] * dones)
                     * self.gammas[name_i]
-                    * next_q_values
+                    * next_q_values.sum(dim=1)
                 )
-                target_q_values = target_q_values.reshape(-1, 1)
+
             curr_q = torch.gather(
-                current_q_values[name], dim=1, index=actions.discrete_tensor
-            )
+                current_q_values[name], dim=1, index=torch.unsqueeze(actions.discrete_tensor, dim=1)
+            ).sum(dim=2).squeeze()
+
             qloss.append(torch.nn.functional.smooth_l1_loss(curr_q, target_q_values))
 
         loss = torch.mean(torch.stack(qloss))
@@ -184,12 +186,11 @@ class QNetwork(nn.Module, Actor, Critic):
     ):
         self.exploration_rate = exploration_initial_eps
         nn.Module.__init__(self)
-        output_act_size = max(sum(action_spec.discrete_branches), 1)
-        self.network_body = ValueNetwork(
+        self.network_body = BranchValueNetwork(
             stream_names,
             observation_specs,
             network_settings,
-            outputs_per_stream=output_act_size,
+            outputs_per_stream=action_spec.discrete_branches,
         )
 
         # extra tensors for exporting to ONNX
@@ -244,9 +245,9 @@ class QNetwork(nn.Module, Actor, Critic):
         memories: Optional[torch.Tensor] = None,
         sequence_length: int = 1,
     ) -> Tuple[Union[int, torch.Tensor], ...]:
-        out_vals, memories = self.critic_pass(inputs, memories, sequence_length)
+        logger.debug('MAB: forward')
 
-        # fixme random action tensor
+        out_vals, memories = self.critic_pass(inputs, memories, sequence_length)
         export_out = [self.version_number, self.memory_size_vector]
 
         disc_action_out = self.get_greedy_action(out_vals)
@@ -256,18 +257,19 @@ class QNetwork(nn.Module, Actor, Critic):
             self.discrete_act_size_vector,
             deterministic_disc_action_out,
         ]
+
         return tuple(export_out)
 
     def get_random_action(self, inputs) -> torch.Tensor:
-        action_out = torch.randint(
-            0, self.action_spec.discrete_branches[0], (len(inputs), 1)
-        )
-        return action_out
+        action_out_list = []
+        for branch_size in self.action_spec.discrete_branches:
+            action_out_list.append(torch.randint(0, branch_size, (len(inputs), 1)))
+        return action_out_list
 
     @staticmethod
     def get_greedy_action(q_values) -> torch.Tensor:
         all_q = torch.cat([val.unsqueeze(0) for val in q_values.values()])
-        return torch.argmax(all_q.sum(dim=0), dim=1, keepdim=True)
+        return torch.split(torch.argmax(all_q.sum(dim=0), dim=1, keepdim=True).squeeze(1), 1, dim=-1)
 
     def get_action_and_stats(
         self,
@@ -280,11 +282,12 @@ class QNetwork(nn.Module, Actor, Critic):
         run_out = {}
         if not deterministic and np.random.rand() < self.exploration_rate:
             action_out = self.get_random_action(inputs)
-            action_out = AgentAction(None, [action_out])
-            run_out["env_action"] = action_out.to_action_tuple()
+            agent_action_random_action_out = AgentAction(None, action_out)
+            run_out["env_action"] = agent_action_random_action_out.to_action_tuple()
+            return agent_action_random_action_out, run_out, torch.Tensor([])
         else:
             out_vals, _ = self.critic_pass(inputs, memories, sequence_length)
             action_out = self.get_greedy_action(out_vals)
-            action_out = AgentAction(None, [action_out])
-            run_out["env_action"] = action_out.to_action_tuple()
-        return action_out, run_out, torch.Tensor([])
+            agent_action_greedy_action_out = AgentAction(None, action_out)
+            run_out["env_action"] = agent_action_greedy_action_out.to_action_tuple()
+            return agent_action_greedy_action_out, run_out, torch.Tensor([])

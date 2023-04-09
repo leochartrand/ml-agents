@@ -11,34 +11,54 @@ from mlagents.trainers.policy.torch_policy import TorchPolicy
 from mlagents.trainers.buffer import AgentBuffer, BufferKey, RewardSignalUtil
 from mlagents.trainers.settings import TrainerSettings, OffPolicyHyperparamSettings
 from mlagents.trainers.settings import ScheduleType, NetworkSettings
+from torch.distributions import Categorical
 from mlagents_envs.logging_util import get_logger
 from mlagents.torch_utils import torch, nn, default_device
 from mlagents_envs.timers import timed
 from mlagents_envs.base_env import ActionSpec, ObservationSpec
 import copy
+from scipy.optimize import minimize
+from torch.distributions import Categorical
 
 logger = get_logger(__name__)
 # TODO: fix saving to onnx
 
+def bt(m):
+    return m.transpose(dim0=-2, dim1=-1)
+
+def btr(m):
+    return m.diagonal(dim1=-2, dim2=-1).sum(-1)
+
+def categorical_kl(p1, p2):
+    """
+    calculates KL between two Categorical distributions
+    :param p1: (B, D)
+    :param p2: (B, D)
+    """
+    p1 = torch.clamp_min(p1, 0.0001)  # actually no need to clamp
+    p2 = torch.clamp_min(p2, 0.0001)  # avoid zero division
+    return torch.mean((p1 * torch.log(p1 / p2)).sum(dim=-1))
+
 
 @attr.s(auto_attribs=True)
 class MPOSettings(OffPolicyHyperparamSettings):
-    dual_constraint: float = 0.0
-    kl_constraint: float = 0.0 # constraint for discrete case (M-step)
-    alpha_scale: float = 0.0 # scaling factor for lagrangian multiplier (M-step)
-    batch_size: int = 0 # minibatch size
-    episode_rerun_num: int = 0 
-    mstep_iteration_num: int = 0 # Number of iterations for M-Step
-    evaluate_episode_maxstep: int = 0 # Maximum evaluate steps of an episode
+    dual_constraint: float = 0.1
+    kl_constraint: float = 0.01 # constraint for discrete case (M-step)
+    alpha_scale: float = 10.0 # scaling factor for lagrangian multiplier (M-step)
+    batch_size: int = 256 # minibatch size
+    episode_rerun_num: int = 3
+    mstep_iteration_num: int = 5 # Number of iterations for M-Step
+    evaluate_episode_maxstep: int = 200 # Maximum evaluate steps of an episode
 
     # The following might not be needed
-    sample_episode_num: int = 0
-    sample_episode_max_steps:int = 0
-    sample_action_num: int = 0
+    sample_episode_num: int = 30
+    sample_episode_max_steps:int = 200
+    sample_action_num: int = 64
 
     # The rest of the parameters are what's classic for ML Agents.
     buffer_size: int = 2000
-    learning_rate: float = 0.001
+    critic_learning_rate: float = 0.001
+    actor_learning_rate: float = 0.001
     num_epoch: int = 3
     learning_rate_schedule: ScheduleType = ScheduleType.LINEAR
 
@@ -60,71 +80,77 @@ class TorchMPOOptimizer(TorchOptimizer):
         super().__init__(policy, trainer_settings)
         reward_signal_configs = trainer_settings.reward_signals
         reward_signal_names = [key.value for key, _ in reward_signal_configs.items()]
+        
 
         self.hyperparameters: MPOSettings = cast(
             MPOSettings, trainer_settings.hyperparameters
         )
 
-        params = list(self.policy.actor.parameters())
+        print("policy.behavior_spec.observation_specs: ", policy.behavior_spec.observation_specs)
 
         self.target_policy = copy.deepcopy(self.policy)
 
-        params += list(self.target_policy.actor.parameters())
+        self._critic = QNetwork(
+            stream_names=self.reward_signals.keys(),
+            observation_specs=policy.behavior_spec.observation_specs,
+            network_settings=policy.network_settings,
+            action_spec=policy.behavior_spec.action_spec,
+        )
+        self._critic.to(default_device())
 
-        if self.hyperparameters.shared_critic:
-            self._critic = policy.actor
-        else:
-            self._critic = QNetwork(
-                stream_names=self.reward_signals.keys(),
-                observation_specs=policy.behavior_spec.observation_specs,
-                network_settings=policy.network_settings,
-                action_spec=policy.behavior_spec.action_spec,
-            )
-            self._critic.to(default_device())
-            params += list(self._critic.parameters())
+        self._target_critic = QNetwork(
+            stream_names=self.reward_signals.keys(),
+            observation_specs=policy.behavior_spec.observation_specs,
+            network_settings=policy.network_settings,
+            action_spec=policy.behavior_spec.action_spec,
+        )
+        self._target_critic.to(default_device())
 
-        
-        if self.hyperparameters.shared_critic:
-            self._target_critic = policy.actor
-        else:
-            self._target_critic = QNetwork(
-                stream_names=self.reward_signals.keys(),
-                observation_specs=policy.behavior_spec.observation_specs,
-                network_settings=policy.network_settings,
-                action_spec=policy.behavior_spec.action_spec,
-            )
-            self._target_critic.to(default_device())
-            params += list(self._target_critic.parameters())
-
-        self.decay_learning_rate = ModelUtils.DecayedValue(
+        self.decay_actor_learning_rate = ModelUtils.DecayedValue(
             self.hyperparameters.learning_rate_schedule,
-            self.hyperparameters.learning_rate,
+            self.hyperparameters.actor_learning_rate,
             1e-10,
             self.trainer_settings.max_steps,
         )
-        self.decay_epsilon = ModelUtils.DecayedValue(
-            self.hyperparameters.epsilon_schedule,
-            self.hyperparameters.epsilon,
-            0.1,
-            self.trainer_settings.max_steps,
-        )
-        self.decay_beta = ModelUtils.DecayedValue(
-            self.hyperparameters.beta_schedule,
-            self.hyperparameters.beta,
-            1e-5,
+
+        self.decay_critic_learning_rate = ModelUtils.DecayedValue(
+            self.hyperparameters.learning_rate_schedule,
+            self.hyperparameters.critic_learning_rate,
+            1e-10,
             self.trainer_settings.max_steps,
         )
 
-        self.optimizer = torch.optim.Adam(
-            params, lr=self.trainer_settings.hyperparameters.learning_rate
+        self.actor_optimizer = torch.optim.Adam(
+            self.policy.actor.parameters(), lr=self.trainer_settings.hyperparameters.actor_learning_rate
         )
+
+        self.critic_optimizer = torch.optim.Adam(
+            self._critic.parameters(), lr=self.trainer_settings.hyperparameters.critic_learning_rate
+        )
+        
+        self.ε_dual: float = self.hyperparameters.dual_constraint
+        self.α: float = 0.0                # Langrangian multiplier for discrete action space (M-step)
+        self.η: float = np.random.rand()   # Parameter to fit in closed form
+        self.max_return_eval: float = -np.inf
+        self.iteration = 1
+        self.γ = self.reward_signals['extrinsic'].gamma
+        self.mstep_iteration_num: int = self.hyperparameters.mstep_iteration_num
+
         self.stats_name_to_update_name = {
             "Losses/Value Loss": "value_loss",
             "Losses/Policy Loss": "policy_loss",
         }
 
         self.stream_names = list(self.reward_signals.keys())
-
+    
+    def __update_params(self):
+        # TODO: UNTESTED FOR OUR CASE
+        # Copy policy parameters
+        for target_param, param in zip(self.target_policy.actor.parameters(), self.policy.actor.parameters()):
+            target_param.data.copy_(param.data)
+        for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data)
+    
     @property
     def critic(self):
         return self._critic
@@ -142,9 +168,8 @@ class TorchMPOOptimizer(TorchOptimizer):
         :return: Results of update.
         """
         # Get decayed parameters
-        decay_lr = self.decay_learning_rate.get_value(self.policy.get_current_step())
-        decay_eps = self.decay_epsilon.get_value(self.policy.get_current_step())
-        decay_bet = self.decay_beta.get_value(self.policy.get_current_step())
+        decay_actor_lr = self.decay_actor_learning_rate.get_value(self.policy.get_current_step())
+        decay_critic_lr = self.decay_critic_learning_rate.get_value(self.policy.get_current_step())
         returns = {}
         old_values = {}
         for name in self.reward_signals:
@@ -160,90 +185,192 @@ class TorchMPOOptimizer(TorchOptimizer):
         # Convert to tensors
         current_obs = [ModelUtils.list_to_tensor(obs) for obs in current_obs]
 
-        act_masks = ModelUtils.list_to_tensor(batch[BufferKey.ACTION_MASK])
-        actions = AgentAction.from_buffer(batch)
+        # act_masks = ModelUtils.list_to_tensor(batch[BufferKey.ACTION_MASK])
+        # actions = AgentAction.from_buffer(batch)
 
         memories = [
             ModelUtils.list_to_tensor(batch[BufferKey.MEMORY][i])
             for i in range(0, len(batch[BufferKey.MEMORY]), self.policy.sequence_length)
         ]
-        if len(memories) > 0:
-            memories = torch.stack(memories).unsqueeze(0)
+        
+        state_batch = ObsUtil.from_buffer(batch, n_obs) # current_obs
+        action_batch = AgentAction.from_buffer(batch) # actions
+        next_state_batch = ObsUtil.from_buffer_next(batch, n_obs) # current_obs
+        reward_batch = 0 # TODO: reward
 
-        # Get value memories
-        value_memories = [
-            ModelUtils.list_to_tensor(batch[BufferKey.CRITIC_MEMORY][i])
-            for i in range(
-                0, len(batch[BufferKey.CRITIC_MEMORY]), self.policy.sequence_length
-            )
-        ]
-        if len(value_memories) > 0:
-            value_memories = torch.stack(value_memories).unsqueeze(0)
-
-        run_out = self.policy.actor.get_stats(
-            current_obs,
-            actions,
-            masks=act_masks,
-            memories=memories,
-            sequence_length=self.policy.sequence_length,
+        K = len(action_batch.discrete_list) # Number of states, same len for actions than for states. Just simpler to use the action list here.
+        # N = # TODO
+        ds = self.policy.behavior_spec.observation_specs # This is a list of observations
+        da = self.policy.behavior_spec.action_spec.discrete_size
+        
+        # Policy Evaluation
+        # [2] 3 Policy Evaluation (Step 1)
+        
+        loss_q, q = self.__update_critic_td(
+            state_batch = state_batch, 
+            action_batch=action_batch, 
+            next_state_batch=next_state_batch, 
+            reward_batch=reward_batch, 
+            ds=ds, 
+            da=da
         )
+        
+        # E-Step of Policy Improvement
+        # [2] 4.1 Finding action weights (Step 2)
 
-        log_probs = run_out["log_probs"]
-        entropy = run_out["entropy"]
+        # TODO: Replace
+        target_q_np = np.array([])
+        b_prob_np = np.array([])
+        
+        # [2] 4.1 Finding action weights (Step 2)
+        #   Using an exponential transformation of the Q-values
+        def dual(self, η): # target_q_np & b_prob_np dims: (K, da)
+            # TODO: UNTESTED FOR OUR CASE
+            max_q = np.max(target_q_np, 1)
+            return η * self.ε_dual + np.mean(max_q) \
+                + η * np.mean(np.log(np.sum(
+                    b_prob_np * np.exp((target_q_np - max_q[:, None]) / η), axis=1)))
+        
+        bounds = [(1e-6, None)]
+        res = minimize(dual, np.array([self.η]), method='SLSQP', bounds=bounds)
+        self.η = res.x[0]
 
-        # Etape 1 : Policy Evaluation
-        values, _ = self.critic.critic_pass(
-            current_obs,
-            memories=value_memories,
-            sequence_length=self.policy.sequence_length,
-        )
+        qij = torch.softmax(target_q / self.η, dim=0) # (N, K) or (da, K)
 
-        old_log_probs = ActionLogProbs.from_buffer(batch).flatten()
-        log_probs = log_probs.flatten()
-        loss_masks = ModelUtils.list_to_tensor(batch[BufferKey.MASKS], dtype=torch.bool)
-        value_loss = ModelUtils.trust_region_value_loss(
-            values, old_values, returns, decay_eps, loss_masks
-        )
-        policy_loss = ModelUtils.trust_region_policy_loss(
-            ModelUtils.list_to_tensor(batch[BufferKey.ADVANTAGES]),
-            log_probs,
-            old_log_probs,
-            loss_masks,
-            decay_eps,
-        )
-        loss = (
-            policy_loss
-            + 0.5 * value_loss
-            - decay_bet * ModelUtils.masked_mean(entropy, loss_masks)
-        )
+        # M-Step of Policy Improvement
+        # [2] 4.2 Fitting an improved policy (Step 3)
+        for _ in range(self.mstep_iteration_num):
+            π_p = self.policy.actor.forward(state_batch)
+            π = Categorical(probs=π_p)
+            # ...
+        
+        
+        
+        
+        # if len(memories) > 0:
+        #     memories = torch.stack(memories).unsqueeze(0)
 
-        # Set optimizer learning rate
-        ModelUtils.update_learning_rate(self.optimizer, decay_lr)
-        self.optimizer.zero_grad()
-        loss.backward()
+        # # Get value memories
+        # value_memories = [
+        #     ModelUtils.list_to_tensor(batch[BufferKey.CRITIC_MEMORY][i])
+        #     for i in range(
+        #         0, len(batch[BufferKey.CRITIC_MEMORY]), self.policy.sequence_length
+        #     )
+        # ]
+        # if len(value_memories) > 0:
+        #     value_memories = torch.stack(value_memories).unsqueeze(0)
 
-        self.optimizer.step()
-        update_stats = {
-            # NOTE: abs() is not technically correct, but matches the behavior in TensorFlow.
-            # TODO: After PyTorch is default, change to something more correct.
-            "Losses/Policy Loss": torch.abs(policy_loss).item(),
-            "Losses/Value Loss": value_loss.item(),
-            "Policy/Learning Rate": decay_lr,
-            "Policy/Epsilon": decay_eps,
-            "Policy/Beta": decay_bet,
-        }
+        # run_out = self.policy.actor.get_stats(
+        #     current_obs,
+        #     actions,
+        #     masks=act_masks,
+        #     memories=memories,
+        #     sequence_length=self.policy.sequence_length,
+        # )
 
-        return update_stats
+        # log_probs = run_out["log_probs"]
+        # entropy = run_out["entropy"]
+
+        # # Etape 1 : Policy Evaluation
+        # values, _ = self.critic.critic_pass(
+        #     current_obs,
+        #     memories=value_memories,
+        #     sequence_length=self.policy.sequence_length,
+        # )
+
+        # old_log_probs = ActionLogProbs.from_buffer(batch).flatten()
+        # log_probs = log_probs.flatten()
+        # loss_masks = ModelUtils.list_to_tensor(batch[BufferKey.MASKS], dtype=torch.bool)
+        # value_loss = ModelUtils.trust_region_value_loss(
+        #     values, old_values, returns, decay_eps, loss_masks
+        # )
+        # policy_loss = ModelUtils.trust_region_policy_loss(
+        #     ModelUtils.list_to_tensor(batch[BufferKey.ADVANTAGES]),
+        #     log_probs,
+        #     old_log_probs,
+        #     loss_masks,
+        #     decay_eps,
+        # )
+        # loss = (
+        #     policy_loss
+        #     + 0.5 * value_loss
+        #     - decay_bet * ModelUtils.masked_mean(entropy, loss_masks)
+        # )
+
+        # # Set optimizer learning rate
+        # ModelUtils.update_learning_rate(self.optimizer, decay_lr)
+        # self.optimizer.zero_grad()
+        # loss.backward()
+
+        # self.optimizer.step()
+        # update_stats = {
+        #     # NOTE: abs() is not technically correct, but matches the behavior in TensorFlow.
+        #     # TODO: After PyTorch is default, change to something more correct.
+        #     "Losses/Policy Loss": torch.abs(policy_loss).item(),
+        #     "Losses/Value Loss": value_loss.item(),
+        #     "Policy/Learning Rate": decay_lr,
+        #     "Policy/Epsilon": decay_eps,
+        #     "Policy/Beta": decay_bet,
+        # }
+
+        # return update_stats
 
     # TODO move module update into TorchOptimizer for reward_provider
     def get_modules(self):
         modules = {
-            "Optimizer:value_optimizer": self.optimizer,
+            "Optimizer:critic_optimizer": self.critic_optimizer,
             "Optimizer:critic": self._critic,
         }
         for reward_provider in self.reward_signals.values():
             modules.update(reward_provider.get_modules())
         return modules
+
+    def __update_critic_td(self,
+                           state_batch,
+                           action_batch,
+                           next_state_batch,
+                           reward_batch,
+                           ds,
+                           da):
+        """
+        :param state_batch: (B, ds)
+        :param action_batch: (B, da) or (B,)
+        :param next_state_batch: (B, ds)
+        :param reward_batch: (B,)
+        :return:
+        """
+        A_eye = torch.eye(da).to(default_device())
+
+        # TODO: NOT TESTED FOR OUR CASE
+        B = state_batch.size(0)
+        with torch.no_grad():
+            r = reward_batch  # (B,)
+            π_p = self.target_policy.actor.forward(next_state_batch)  # (B, da)
+            π = Categorical(probs=π_p)  # (B,)
+            π_prob = π.expand((da, B)).log_prob(
+                torch.arange(da)[..., None].expand(-1, B).to(self.device)  # (da, B)
+            ).exp().transpose(0, 1)  # (B, da)
+            sampled_next_actions = A_eye[None, ...].expand(B, -1, -1)  # (B, da, da)
+            expanded_next_states = next_state_batch[:, None, :].expand(-1, da, -1)  # (B, da, ds)
+            expected_next_q = (
+                self.target_critic.forward(
+                    expanded_next_states.reshape(-1, ds),  # (B * da, ds)
+                    sampled_next_actions.reshape(-1, da)  # (B * da, da)
+                ).reshape(B, da) * π_prob  # (B, da)
+            ).sum(dim=-1)  # (B,)
+            y = r + self.γ * expected_next_q
+        self.critic_optimizer.zero_grad()
+
+        t = self.critic(
+            state_batch,
+            A_eye[action_batch.long()]
+        ).squeeze(-1)  # (B,)
+        
+        loss = self.norm_loss_q(y, t)
+        loss.backward()
+        self.critic_optimizer.step()
+        return loss, y
+
 
 
 class QNetwork(nn.Module, Actor, Critic):

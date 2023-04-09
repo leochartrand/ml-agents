@@ -9,7 +9,8 @@ import numpy as np
 from mlagents_envs.base_env import BehaviorSpec
 from mlagents_envs.logging_util import get_logger
 from mlagents.trainers.buffer import BufferKey, RewardSignalUtil
-from mlagents.trainers.trainer.on_policy_trainer import OnPolicyTrainer
+# from mlagents.trainers.trainer.on_policy_trainer import OnPolicyTrainer
+from mlagents.trainers.trainer.off_policy_trainer import OffPolicyTrainer
 from mlagents.trainers.policy.policy import Policy
 from mlagents.trainers.trainer.trainer_utils import get_gae
 from mlagents.trainers.optimizer.torch_optimizer import TorchOptimizer
@@ -26,7 +27,7 @@ logger = get_logger(__name__)
 TRAINER_NAME = "mpo"
 
 
-class MPOTrainer(OnPolicyTrainer):
+class MPOTrainer(OffPolicyTrainer):
     """The MPOTrainer is an implementation of the MPO algorithm."""
 
     def __init__(
@@ -119,44 +120,44 @@ class MPOTrainer(OnPolicyTrainer):
             # Report the reward signals
             self.collected_rewards[name][agent_id] += np.sum(evaluate_result)
 
-        # Compute GAE and returns
-        tmp_advantages = []
-        tmp_returns = []
-        for name in self.optimizer.reward_signals:
-            bootstrap_value = value_next[name]
+        # # Compute GAE and returns
+        # tmp_advantages = []
+        # tmp_returns = []
+        # for name in self.optimizer.reward_signals:
+        #     bootstrap_value = value_next[name]
 
-            local_rewards = agent_buffer_trajectory[
-                RewardSignalUtil.rewards_key(name)
-            ].get_batch()
-            local_value_estimates = agent_buffer_trajectory[
-                RewardSignalUtil.value_estimates_key(name)
-            ].get_batch()
+        #     local_rewards = agent_buffer_trajectory[
+        #         RewardSignalUtil.rewards_key(name)
+        #     ].get_batch()
+        #     local_value_estimates = agent_buffer_trajectory[
+        #         RewardSignalUtil.value_estimates_key(name)
+        #     ].get_batch()
 
-            local_advantage = get_gae(
-                rewards=local_rewards,
-                value_estimates=local_value_estimates,
-                value_next=bootstrap_value,
-                gamma=self.optimizer.reward_signals[name].gamma,
-                lambd=self.hyperparameters.lambd,
-            )
-            local_return = local_advantage + local_value_estimates
-            # This is later use as target for the different value estimates
-            agent_buffer_trajectory[RewardSignalUtil.returns_key(name)].set(
-                local_return
-            )
-            agent_buffer_trajectory[RewardSignalUtil.advantage_key(name)].set(
-                local_advantage
-            )
-            tmp_advantages.append(local_advantage)
-            tmp_returns.append(local_return)
+        #     local_advantage = get_gae(
+        #         rewards=local_rewards,
+        #         value_estimates=local_value_estimates,
+        #         value_next=bootstrap_value,
+        #         gamma=self.optimizer.reward_signals[name].gamma,
+        #         lambd=self.hyperparameters.lambd,
+        #     )
+        #     local_return = local_advantage + local_value_estimates
+        #     # This is later use as target for the different value estimates
+        #     agent_buffer_trajectory[RewardSignalUtil.returns_key(name)].set(
+        #         local_return
+        #     )
+        #     agent_buffer_trajectory[RewardSignalUtil.advantage_key(name)].set(
+        #         local_advantage
+        #     )
+        #     tmp_advantages.append(local_advantage)
+        #     tmp_returns.append(local_return)
 
         # Get global advantages
-        global_advantages = list(
-            np.mean(np.array(tmp_advantages, dtype=np.float32), axis=0)
-        )
-        global_returns = list(np.mean(np.array(tmp_returns, dtype=np.float32), axis=0))
-        agent_buffer_trajectory[BufferKey.ADVANTAGES].set(global_advantages)
-        agent_buffer_trajectory[BufferKey.DISCOUNTED_RETURNS].set(global_returns)
+        # global_advantages = list(
+        #     np.mean(np.array(tmp_advantages, dtype=np.float32), axis=0)
+        # )
+        # global_returns = list(np.mean(np.array(tmp_returns, dtype=np.float32), axis=0))
+        # agent_buffer_trajectory[BufferKey.ADVANTAGES].set(global_advantages)
+        # agent_buffer_trajectory[BufferKey.DISCOUNTED_RETURNS].set(global_returns)
 
         self._append_to_update_buffer(agent_buffer_trajectory)
 

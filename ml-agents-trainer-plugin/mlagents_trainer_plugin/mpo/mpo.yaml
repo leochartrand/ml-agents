@@ -2,22 +2,23 @@ behaviors:
   SoccerTwos:
     trainer_type: mpo
     hyperparameters:
-      dual_constraint: 1.0
-      kl_constraint: 1.0 # constraint for discrete case (M-step)
-      alpha_scale: 1.0 # scaling factor for lagrangian multiplier (M-step)
-      batch_size: 128 # minibatch size
-      episode_rerun_num: 1 
-      mstep_iteration_num: 1 # Number of iterations for M-Step
-      evaluate_episode_maxstep: 1 # Maximum evaluate steps of an episode
+      dual_constraint: 0.1
+      kl_constraint: 0.01 # constraint for discrete case (M-step)
+      alpha_scale: 10.0 # scaling factor for lagrangian multiplier (M-step)
+      batch_size: 256 # minibatch size
+      episode_rerun_num: 3
+      mstep_iteration_num: 5 # Number of iterations for M-Step
+      evaluate_episode_maxstep: 200 # Maximum evaluate steps of an episode
 
       # The following might not be needed
-      sample_episode_num: 1
-      sample_episode_max_steps: 1
-      sample_action_num: 1
+      sample_episode_num: 30
+      sample_episode_max_steps: 200
+      sample_action_num: 64
 
       # The rest of the parameters are what's classic for ML Agents.
       buffer_size: 2000
-      learning_rate: 0.001
+      critic_learning_rate: 0.001
+      actor_learning_rate: 0.001
       num_epoch: 3
       learning_rate_schedule: linear
       shared_critic: False

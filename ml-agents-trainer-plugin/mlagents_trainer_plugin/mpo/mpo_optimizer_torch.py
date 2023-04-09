@@ -43,6 +43,7 @@ class MPOSettings(OffPolicyHyperparamSettings):
     learning_rate_schedule: ScheduleType = ScheduleType.LINEAR
 
     gamma: float = 0.99
+    shared_critic: bool = False
 
 
 class TorchMPOOptimizer(TorchOptimizer):

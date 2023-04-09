@@ -19,6 +19,7 @@ from mlagents_envs.base_env import ActionSpec, ObservationSpec
 import copy
 from scipy.optimize import minimize
 from torch.distributions import Categorical
+from torch.nn.utils import clip_grad_norm_
 
 logger = get_logger(__name__)
 # TODO: fix saving to onnx
@@ -80,7 +81,7 @@ class TorchMPOOptimizer(TorchOptimizer):
         super().__init__(policy, trainer_settings)
         reward_signal_configs = trainer_settings.reward_signals
         reward_signal_names = [key.value for key, _ in reward_signal_configs.items()]
-        
+
 
         self.hyperparameters: MPOSettings = cast(
             MPOSettings, trainer_settings.hyperparameters
@@ -127,7 +128,7 @@ class TorchMPOOptimizer(TorchOptimizer):
         self.critic_optimizer = torch.optim.Adam(
             self._critic.parameters(), lr=self.trainer_settings.hyperparameters.critic_learning_rate
         )
-        
+
         self.ε_dual: float = self.hyperparameters.dual_constraint
         self.α: float = 0.0                # Langrangian multiplier for discrete action space (M-step)
         self.η: float = np.random.rand()   # Parameter to fit in closed form
@@ -142,7 +143,7 @@ class TorchMPOOptimizer(TorchOptimizer):
         }
 
         self.stream_names = list(self.reward_signals.keys())
-    
+
     def __update_params(self):
         # TODO: UNTESTED FOR OUR CASE
         # Copy policy parameters
@@ -150,7 +151,7 @@ class TorchMPOOptimizer(TorchOptimizer):
             target_param.data.copy_(param.data)
         for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
             target_param.data.copy_(param.data)
-    
+
     @property
     def critic(self):
         return self._critic
@@ -192,8 +193,12 @@ class TorchMPOOptimizer(TorchOptimizer):
             ModelUtils.list_to_tensor(batch[BufferKey.MEMORY][i])
             for i in range(0, len(batch[BufferKey.MEMORY]), self.policy.sequence_length)
         ]
-        
+
+        print('before ObsUtil.from_buffer(batch, n_obs): ', type(ObsUtil.from_buffer(batch, n_obs)))
+
         state_batch = ObsUtil.from_buffer(batch, n_obs) # current_obs
+
+        print('state_batch: ', type(state_batch))
         action_batch = AgentAction.from_buffer(batch) # actions
         next_state_batch = ObsUtil.from_buffer_next(batch, n_obs) # current_obs
         reward_batch = 0 # TODO: reward
@@ -202,26 +207,38 @@ class TorchMPOOptimizer(TorchOptimizer):
         # N = # TODO
         ds = self.policy.behavior_spec.observation_specs # This is a list of observations
         da = self.policy.behavior_spec.action_spec.discrete_size
-        
+
         # Policy Evaluation
         # [2] 3 Policy Evaluation (Step 1)
-        
+
         loss_q, q = self.__update_critic_td(
-            state_batch = state_batch, 
-            action_batch=action_batch, 
-            next_state_batch=next_state_batch, 
-            reward_batch=reward_batch, 
-            ds=ds, 
+            state_batch = state_batch,
+            action_batch= action_batch,
+            next_state_batch= next_state_batch,
+            reward_batch= reward_batch,
+            ds=ds,
             da=da
         )
-        
+# rip
         # E-Step of Policy Improvement
         # [2] 4.1 Finding action weights (Step 2)
+        A_eye = torch.eye(da).to(default_device())
+        with torch.no_grad():
+            actions = torch.arange(da)[..., None].expand(da, K).to(self.device)  # (da, K)
+            b_p = self.target_actor.forward(state_batch)  # (K, da)
+            b = Categorical(probs=b_p)  # (K,)
+            b_prob = b.expand((da, K)).log_prob(actions).exp()  # (da, K)
+            expanded_actions = self.A_eye[None, ...].expand(K, -1, -1)  # (K, da, da)
+            expanded_states = state_batch.reshape(K, 1, ds).expand((K, da, ds))  # (K, da, ds)
+            target_q = (
+                self.target_critic.forward(
+                    expanded_states.reshape(-1, ds),  # (K * da, ds)
+                    expanded_actions.reshape(-1, da)  # (K * da, da)
+                ).reshape(K, da)  # (K, da)
+            ).transpose(0, 1)  # (da, K)
+            b_prob_np = b_prob.cpu().transpose(0, 1).numpy()  # (K, da)
+            target_q_np = target_q.cpu().transpose(0, 1).numpy()  # (K, da)
 
-        # TODO: Replace
-        target_q_np = np.array([])
-        b_prob_np = np.array([])
-        
         # [2] 4.1 Finding action weights (Step 2)
         #   Using an exponential transformation of the Q-values
         def dual(self, η): # target_q_np & b_prob_np dims: (K, da)
@@ -230,7 +247,7 @@ class TorchMPOOptimizer(TorchOptimizer):
             return η * self.ε_dual + np.mean(max_q) \
                 + η * np.mean(np.log(np.sum(
                     b_prob_np * np.exp((target_q_np - max_q[:, None]) / η), axis=1)))
-        
+
         bounds = [(1e-6, None)]
         res = minimize(dual, np.array([self.η]), method='SLSQP', bounds=bounds)
         self.η = res.x[0]
@@ -240,13 +257,41 @@ class TorchMPOOptimizer(TorchOptimizer):
         # M-Step of Policy Improvement
         # [2] 4.2 Fitting an improved policy (Step 3)
         for _ in range(self.mstep_iteration_num):
-            π_p = self.policy.actor.forward(state_batch)
-            π = Categorical(probs=π_p)
-            # ...
-        
-        
-        
-        
+            π_p = self.actor.forward(state_batch)  # (K, da)
+            # First term of last eq of [2] p.5
+            π = Categorical(probs=π_p)  # (K,)
+            loss_p = torch.mean(
+                qij * π.expand((da, K)).log_prob(actions)
+            )
+
+            mean_loss_p.append((-loss_p).item())
+
+            kl = categorical_kl(p1=π_p, p2=b_p)
+            max_kl.append(kl.item())
+
+            if np.isnan(kl.item()):  # This should not happen
+                raise RuntimeError('kl is nan')
+
+            # Update lagrange multipliers by gradient descent
+            # this equation is derived from last eq of [2] p.5,
+            # just differentiate with respect to α
+            # and update α so that the equation is to be minimized.
+            self.α -= self.α_scale * (self.ε_kl - kl).detach().item()
+
+            self.α = np.clip(self.α, 0.0, self.α_max)
+
+            self.actor_optimizer.zero_grad()
+            # last eq of [2] p.5
+            loss_l = -(loss_p + self.α * (self.ε_kl - kl))
+            mean_loss_l.append(loss_l.item())
+            loss_l.backward()
+            clip_grad_norm_(self.actor.parameters(), 0.1)
+            self.actor_optimizer.step()
+
+        # TODO: WHERE TF DO WE PUT THAT LINE?!
+        # self.__update_param()
+
+
         # if len(memories) > 0:
         #     memories = torch.stack(memories).unsqueeze(0)
 
@@ -365,7 +410,7 @@ class TorchMPOOptimizer(TorchOptimizer):
             state_batch,
             A_eye[action_batch.long()]
         ).squeeze(-1)  # (B,)
-        
+
         loss = self.norm_loss_q(y, t)
         loss.backward()
         self.critic_optimizer.step()

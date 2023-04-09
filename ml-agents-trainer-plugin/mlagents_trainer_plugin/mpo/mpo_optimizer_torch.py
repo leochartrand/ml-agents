@@ -23,24 +23,26 @@ logger = get_logger(__name__)
 
 @attr.s(auto_attribs=True)
 class MPOSettings(OffPolicyHyperparamSettings):
-    beta: float = 5.0e-3
-    epsilon: float = 0.2
-    lambd: float = 0.95
+    dual_constraint: float = 0.0
+    kl_constraint: float = 0.0 # constraint for discrete case (M-step)
+    alpha_scale: float = 0.0 # scaling factor for lagrangian multiplier (M-step)
+    batch_size: int = 0 # minibatch size
+    episode_rerun_num: int = 0 
+    mstep_iteration_num: int = 0 # Number of iterations for M-Step
+    evaluate_episode_maxstep: int = 0 # Maximum evaluate steps of an episode
+
+    # The following might not be needed
+    sample_episode_num: int = 0
+    sample_episode_max_steps:int = 0
+    sample_action_num: int = 0
+
+    # The rest of the parameters are what's classic for ML Agents.
+    buffer_size: int = 2000
+    learning_rate: float = 0.001
     num_epoch: int = 3
-    shared_critic: bool = False
     learning_rate_schedule: ScheduleType = ScheduleType.LINEAR
-    beta_schedule: ScheduleType = ScheduleType.LINEAR
-    epsilon_schedule: ScheduleType = ScheduleType.LINEAR
 
     gamma: float = 0.99
-    exploration_schedule: ScheduleType = ScheduleType.LINEAR
-    exploration_initial_eps: float = 0.1
-    exploration_final_eps: float = 0.05
-    target_update_interval: int = 10000
-    tau: float = 0.005
-    steps_per_update: float = 1
-    save_replay_buffer: bool = False
-    reward_signal_steps_per_update: float = attr.ib()
 
 
 class TorchMPOOptimizer(TorchOptimizer):

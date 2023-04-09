@@ -1,4 +1,4 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 from mlagents.plugins import ML_AGENTS_TRAINER_TYPE
 
 setup(
@@ -9,10 +9,12 @@ setup(
     #
     # Here, the get_example_stats_writer() function in mlagents_plugin_examples/example_stats_writer.py
     # will get registered with the ML_AGENTS_STATS_WRITER plugin interface.
+    packages=find_packages(exclude=['plots']),
     entry_points={
         ML_AGENTS_TRAINER_TYPE: [
             "a2c=mlagents_trainer_plugin.a2c.a2c_trainer:get_type_and_setting",
             "dqn=mlagents_trainer_plugin.dqn.dqn_trainer:get_type_and_setting",
+            "mpo=mlagents_trainer_plugin.mpo.mpo_trainer:get_type_and_setting",
         ]
     },
 )

@@ -252,7 +252,6 @@ class NetworkBody(nn.Module):
         if self.use_lstm:
             # Resize to (batch, sequence length, encoding size)
             encoding = encoding.reshape([-1, sequence_length, self.h_size])
-            self.lstm.flatten_parameters()
             encoding, memories = self.lstm(encoding, memories)
             encoding = encoding.reshape([-1, self.m_size // 2])
         return encoding, memories

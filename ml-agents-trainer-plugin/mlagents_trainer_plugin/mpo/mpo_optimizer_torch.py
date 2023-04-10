@@ -47,7 +47,6 @@ class MPOSettings(OffPolicyHyperparamSettings):
     kl_constraint: float = 0.01 # constraint for discrete case (M-step)
     alpha_scale: float = 10.0 # scaling factor for lagrangian multiplier (M-step)
     batch_size: int = 256 # minibatch size
-    episode_rerun_num: int = 3
     mstep_iteration_num: int = 5 # Number of iterations for M-Step
     evaluate_episode_maxstep: int = 200 # Maximum evaluate steps of an episode
     alpha_max: float = 1.0

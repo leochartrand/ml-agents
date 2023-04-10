@@ -7,8 +7,7 @@ behaviors:
       alpha_max: 1.0
       alpha_scale: 10.0 # scaling factor for lagrangian multiplier (M-step)
       batch_size: 256 # minibatch size
-      episode_rerun_num: 3
-      mstep_iteration_num: 5 # Number of iterations for M-Step
+      mstep_iteration_num: 1 # Number of iterations for M-Step
       evaluate_episode_maxstep: 200 # Maximum evaluate steps of an episode
 
       # The following might not be needed

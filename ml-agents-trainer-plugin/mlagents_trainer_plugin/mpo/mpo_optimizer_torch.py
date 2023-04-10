@@ -178,7 +178,7 @@ class TorchMPOOptimizer(TorchOptimizer):
             rewards[name] = ModelUtils.list_to_tensor(
                 batch[RewardSignalUtil.rewards_key(name)]
             )
-            
+
             # old_values[name] = ModelUtils.list_to_tensor(
             #     batch[RewardSignalUtil.value_estimates_key(name)]
             # )
@@ -240,10 +240,10 @@ class TorchMPOOptimizer(TorchOptimizer):
                 sequence_length=self.target_policy.sequence_length,
             )
             π_prob = run_out["log_probs"].discrete_tensor # fixme: is the order good?
-            sampled_next_actions = A_eye[None, ...].expand(B, -1, -1) 
+            sampled_next_actions = A_eye[None, ...].expand(B, -1, -1)
             expanded_next_states = next_state_batch
             for index, state in enumerate(expanded_next_states):
-                state = state[:, None, :].expand(-1, da, -1).reshape(-1, ds[index].shape[0]) 
+                state = state[:, None, :].expand(-1, da, -1).reshape(-1, ds[index].shape[0])
 
             expected_next_q, _ = self.target_critic.critic_pass(
                 expanded_next_states,
@@ -285,27 +285,27 @@ class TorchMPOOptimizer(TorchOptimizer):
             )
             b_prob = run_out["log_probs"].discrete_tensor # fixme: is the order good?
 
-            expanded_actions = A_eye[None, ...].expand(K, -1, -1) 
+            expanded_actions = A_eye[None, ...].expand(K, -1, -1)
             expanded_states = state_batch
             for index, state in enumerate(expanded_states):
-                state = state[:, None, :].expand(-1, da, -1).reshape(-1, ds[index].shape[0]) 
+                state = state[:, None, :].expand(-1, da, -1).reshape(-1, ds[index].shape[0])
 
             target_q, _ = self.target_critic.critic_pass(
-                    expanded_states, 
+                    expanded_states,
                     # expanded_actions.reshape(-1, da) # FIXME
                     memories=value_memories,
                     sequence_length=self.target_policy.sequence_length,
                 )
-            target_q = torch.gather(target_q['extrinsic'], 2, action_batch.discrete_tensor.unsqueeze(-1)).squeeze()       
+            target_q = torch.gather(target_q['extrinsic'], 2, action_batch.discrete_tensor.unsqueeze(-1)).squeeze()
 
-            b_prob_np = b_prob.cpu().numpy() 
-            target_q_np = target_q.cpu().numpy() 
+            b_prob_np = b_prob.cpu().numpy()
+            target_q_np = target_q.cpu().numpy()
             print("b_prob_np size: ", b_prob_np.shape)
             print("target_q_np size: ", target_q_np.shape)
 
         # [2] 4.1 Finding action weights (Step 2)
         #   Using an exponential transformation of the Q-values
-        def dual(self, η): 
+        def dual(η):
             # TODO: UNTESTED FOR OUR CASE
             max_q = np.max(target_q_np, 1)
             return η * self.ε_dual + np.mean(max_q) \

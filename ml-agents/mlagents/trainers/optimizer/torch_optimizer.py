@@ -119,7 +119,7 @@ class TorchOptimizer(Optimizer):
                 all_next_memories.append(ModelUtils.to_numpy(_mem.squeeze()))
 
             last_values, _mem = self.critic.critic_pass(
-                seq_obs, _mem, sequence_length=leftover_seq_len
+                seq_obs, memories=_mem, sequence_length=leftover_seq_len
             )
             for signal_name, _val in last_values.items():
                 all_values[signal_name].append(_val)

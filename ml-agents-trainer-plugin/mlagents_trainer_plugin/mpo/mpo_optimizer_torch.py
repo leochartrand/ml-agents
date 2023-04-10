@@ -173,13 +173,6 @@ class TorchMPOOptimizer(TorchOptimizer):
         :param num_sequences: Number of sequences to process.
         :return: Results of update.
         """
-        # Get decayed parameters
-        rewards =  {}
-        for name in self.reward_signals:
-            rewards[name] = ModelUtils.list_to_tensor(
-                batch[RewardSignalUtil.rewards_key(name)]
-            )
-
         n_obs = len(self.policy.behavior_spec.observation_specs)
 
         memories = [
@@ -200,16 +193,12 @@ class TorchMPOOptimizer(TorchOptimizer):
             value_memories = torch.stack(value_memories).unsqueeze(0)
 
         state_batch = [ModelUtils.list_to_tensor(obs) for obs in ObsUtil.from_buffer(batch, n_obs)]
-        # state_batch = torch.cat(state_batch, dim=1)
         action_batch = AgentAction.from_buffer(batch) # actions
         next_state_batch = [ModelUtils.list_to_tensor(obs) for obs in ObsUtil.from_buffer_next(batch, n_obs)]
-        # next_state_batch = torch.cat(next_state_batch, dim=1)
-        reward_batch = rewards['extrinsic']
-
+        reward_batch = ModelUtils.list_to_tensor(batch[RewardSignalUtil.rewards_key('extrinsic')])
         act_masks = ModelUtils.list_to_tensor(batch[BufferKey.ACTION_MASK])
 
         K = len(action_batch.discrete_list) # Number of states, same len for actions than for states. Just simpler to use the action list here.
-        # N = # TODO
         ds = self.policy.behavior_spec.observation_specs # This is a list of observations
         da = self.policy.behavior_spec.action_spec.discrete_size
         # Policy Evaluation
@@ -342,8 +331,7 @@ class TorchMPOOptimizer(TorchOptimizer):
             clip_grad_norm_(self.policy.actor.parameters(), 0.1)
             self.actor_optimizer.step()
 
-        # TODO: WHERE TF DO WE PUT THAT LINE?!
-        # self.__update_param()
+        self.__update_params()
 
         update_stats = {
             # NOTE: abs() is not technically correct, but matches the behavior in TensorFlow.

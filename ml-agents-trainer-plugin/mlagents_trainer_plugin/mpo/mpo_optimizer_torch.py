@@ -50,22 +50,11 @@ class MPOSettings(OffPolicyHyperparamSettings):
     mstep_iteration_num: int = 5 # Number of iterations for M-Step
     evaluate_episode_maxstep: int = 200 # Maximum evaluate steps of an episode
     alpha_max: float = 1.0
-
-    # The following might not be needed
-    sample_episode_num: int = 30
-    sample_episode_max_steps:int = 200
-    sample_action_num: int = 64
-
-    # The rest of the parameters are what's classic for ML Agents.
-    buffer_size: int = 2000
-    critic_learning_rate: float = 0.001
     actor_learning_rate: float = 0.001
-    num_epoch: int = 3
+    critic_learning_rate: float = 0.001
+    buffer_size: int = 200000
     learning_rate_schedule: ScheduleType = ScheduleType.LINEAR
-
     gamma: float = 0.99
-    shared_critic: bool = False
-
 
 class TorchMPOOptimizer(TorchOptimizer):
     def __init__(self, policy: TorchPolicy, trainer_settings: TrainerSettings):
@@ -79,9 +68,6 @@ class TorchMPOOptimizer(TorchOptimizer):
         # Create the graph here to give more granular control of the TF graph to the Optimizer.
 
         super().__init__(policy, trainer_settings)
-        reward_signal_configs = trainer_settings.reward_signals
-        reward_signal_names = [key.value for key, _ in reward_signal_configs.items()]
-
 
         self.hyperparameters: MPOSettings = cast(
             MPOSettings, trainer_settings.hyperparameters
@@ -105,21 +91,7 @@ class TorchMPOOptimizer(TorchOptimizer):
         )
         self._target_critic.to(default_device())
 
-        self.decay_actor_learning_rate = ModelUtils.DecayedValue(
-            self.hyperparameters.learning_rate_schedule,
-            self.hyperparameters.actor_learning_rate,
-            1e-10,
-            self.trainer_settings.max_steps,
-        )
-
         self.norm_loss_q = nn.MSELoss()
-
-        self.decay_critic_learning_rate = ModelUtils.DecayedValue(
-            self.hyperparameters.learning_rate_schedule,
-            self.hyperparameters.critic_learning_rate,
-            1e-10,
-            self.trainer_settings.max_steps,
-        )
 
         self.actor_optimizer = torch.optim.Adam(
             self.policy.actor.parameters(), lr=self.trainer_settings.hyperparameters.actor_learning_rate
@@ -145,8 +117,6 @@ class TorchMPOOptimizer(TorchOptimizer):
         self.α_scale = self.hyperparameters.alpha_scale
         self.ε_kl = self.hyperparameters.kl_constraint
         self.α_max = self.hyperparameters.alpha_max
-        
-        self.stream_names = list(self.reward_signals.keys())
 
     def __update_params(self):
         # TODO: UNTESTED FOR OUR CASE
@@ -197,17 +167,11 @@ class TorchMPOOptimizer(TorchOptimizer):
         reward_batch = ModelUtils.list_to_tensor(batch[RewardSignalUtil.rewards_key('extrinsic')])
         act_masks = ModelUtils.list_to_tensor(batch[BufferKey.ACTION_MASK])
 
-        K = len(action_batch.discrete_list) # Number of states, same len for actions than for states. Just simpler to use the action list here.
         ds = self.policy.behavior_spec.observation_specs # This is a list of observations
         da = self.policy.behavior_spec.action_spec.discrete_size
+        
         # Policy Evaluation
-        # [2] 3 Policy Evaluation (Step 1)
-
-        A_eye = torch.eye(da).to(default_device())
-        # TODO: NOT TESTED FOR OUR CASE
-        B = self.hyperparameters.batch_size
         with torch.no_grad():
-            r = reward_batch
             run_out = self.target_policy.actor.get_stats(
                 next_state_batch,
                 action_batch,
@@ -215,85 +179,73 @@ class TorchMPOOptimizer(TorchOptimizer):
                 memories=memories,
                 sequence_length=self.target_policy.sequence_length,
             )
-            π_prob = run_out["log_probs"].discrete_tensor.exp() # fixme: is the order good?
-            sampled_next_actions = A_eye[None, ...].expand(B, -1, -1)
+            target_next_π_prob = run_out["log_probs"].discrete_tensor.exp() 
             expanded_next_states = next_state_batch
             for index, state in enumerate(expanded_next_states):
                 state = state[:, None, :].expand(-1, da, -1).reshape(-1, ds[index].shape[0])
 
             expected_next_q, _ = self.target_critic.critic_pass(
                 expanded_next_states,
-                # sampled_next_actions.reshape(-1, da), # FIXME
                 memories=value_memories,
                 sequence_length=self.target_policy.sequence_length,
             )
 
-            expected_next_q = torch.gather(expected_next_q['extrinsic'], 2, action_batch.discrete_tensor.unsqueeze(-1)).squeeze() # FIXME do we gather on the right axis? (btwn 1 or 2)
-
-            expected_next_q = expected_next_q * π_prob # fixme: is the order good?
+            expected_next_q = torch.gather(expected_next_q['extrinsic'], 2, action_batch.discrete_tensor.unsqueeze(-1)).squeeze() 
+            expected_next_q = expected_next_q * target_next_π_prob 
             expected_next_q = expected_next_q.sum(dim=-1)
 
-            y = r + self.γ * expected_next_q
+            y = reward_batch + self.γ * expected_next_q
         self.critic_optimizer.zero_grad()
         t, _ = self.critic.critic_pass(
             state_batch,
-            # A_eye[action_batch] # FIXME
             memories=value_memories,
             sequence_length=self.policy.sequence_length,
         )
 
-        t = torch.gather(t['extrinsic'], 2, action_batch.discrete_tensor.unsqueeze(-1)).squeeze().sum(dim=-1) # FIXME do we gather on the right axis? (btwn 1 or 2)
+        t = torch.gather(t['extrinsic'], 2, action_batch.discrete_tensor.unsqueeze(-1)).squeeze().sum(dim=-1) 
         loss = self.norm_loss_q(y, t)
         loss.backward()
         self.critic_optimizer.step()
 
         # E-Step of Policy Improvement
-        # [2] 4.1 Finding action weights (Step 2)
         with torch.no_grad():
-            actions = torch.arange(da)[..., None].expand(da, K).to(default_device())
-
             run_out = self.target_policy.actor.get_stats(
-                next_state_batch,
+                state_batch,
                 action_batch,
                 masks=act_masks,
                 memories=memories,
                 sequence_length=self.target_policy.sequence_length,
             )
-            b_prob = run_out["log_probs"].discrete_tensor.exp() # fixme: is the order good?
+            target_π_prob = run_out["log_probs"].discrete_tensor.exp() 
 
-            expanded_actions = A_eye[None, ...].expand(K, -1, -1)
             expanded_states = state_batch
             for index, state in enumerate(expanded_states):
                 state = state[:, None, :].expand(-1, da, -1).reshape(-1, ds[index].shape[0])
 
             target_q, _ = self.target_critic.critic_pass(
-                    expanded_states,
-                    # expanded_actions.reshape(-1, da) # FIXME
-                    memories=value_memories,
-                    sequence_length=self.target_policy.sequence_length,
-                )
+                expanded_states,
+                memories=value_memories,
+                sequence_length=self.target_policy.sequence_length,
+            )
             target_q = torch.gather(target_q['extrinsic'], 2, action_batch.discrete_tensor.unsqueeze(-1)).squeeze()
 
-            b_prob_np = b_prob.cpu().numpy()
+            target_π_prob_np = target_π_prob.cpu().numpy()
             target_q_np = target_q.cpu().numpy()
 
-        # [2] 4.1 Finding action weights (Step 2)
-        #   Using an exponential transformation of the Q-values
+        # https://github.com/daisatojp/mpo
         def dual(η):
-            # TODO: UNTESTED FOR OUR CASE
             max_q = np.max(target_q_np, 1)
             return η * self.ε_dual + np.mean(max_q) \
                 + η * np.mean(np.log(np.sum(
-                    b_prob_np * np.exp((target_q_np - max_q[:, None]) / η), axis=1)))
+                    target_π_prob_np * np.exp((target_q_np - max_q[:, None]) / η), axis=1)))
 
         bounds = [(1e-6, None)]
         res = minimize(dual, np.array([self.η]), method='SLSQP', bounds=bounds)
         self.η = res.x[0]
 
-        qij = torch.softmax(target_q / self.η, dim=0) # (N, K) or (da, K)
+        qij = torch.softmax(target_q / self.η, dim=0)
 
         # M-Step of Policy Improvement
-        # [2] 4.2 Fitting an improved policy (Step 3)
         for _ in range(self.mstep_iteration_num):
             run_out = self.policy.actor.get_stats(
                 state_batch,
@@ -301,8 +253,7 @@ class TorchMPOOptimizer(TorchOptimizer):
                 masks=act_masks,
                 memories=memories,
                 sequence_length=self.target_policy.sequence_length,
-            )  # (K, da)
-            # First term of last eq of [2] p.5
+            ) 
             π_log_probs = run_out["log_probs"].discrete_tensor
             loss_p = torch.mean(
                 qij * π_log_probs
@@ -310,21 +261,14 @@ class TorchMPOOptimizer(TorchOptimizer):
 
             π_p = π_log_probs.exp()
 
-            kl = categorical_kl(p1=π_p, p2=b_prob)
+            kl = categorical_kl(p1=π_p, p2=target_π_prob)
 
-            if np.isnan(kl.item()):  # This should not happen
+            if np.isnan(kl.item()): 
                 raise RuntimeError('kl is nan')
 
-            # Update lagrange multipliers by gradient descent
-            # this equation is derived from last eq of [2] p.5,
-            # just differentiate with respect to α
-            # and update α so that the equation is to be minimized.
             self.α -= self.α_scale * (self.ε_kl - kl).detach().item()
-
             self.α = np.clip(self.α, 0.0, self.α_max)
-
             self.actor_optimizer.zero_grad()
-            # last eq of [2] p.5
             loss_l = -(loss_p + self.α * (self.ε_kl - kl))
             loss_l.backward()
             clip_grad_norm_(self.policy.actor.parameters(), 0.1)
@@ -338,20 +282,6 @@ class TorchMPOOptimizer(TorchOptimizer):
             "Losses/loss_p": torch.abs(loss_p).item(),
             "Losses/Policy Loss": torch.abs(loss_l).item(),
         }
-
-        # update_stats = {
-        #     "Losses/Policy Loss": policy_loss.item(),
-        #     "Losses/Value Loss": value_loss.item(),
-        #     "Losses/Q1 Loss": q1_loss.item(),
-        #     "Losses/Q2 Loss": q2_loss.item(),
-        #     "Policy/Discrete Entropy Coeff": torch.mean(
-        #         torch.exp(self._log_ent_coef.discrete)
-        #     ).item(),
-        #     "Policy/Continuous Entropy Coeff": torch.mean(
-        #         torch.exp(self._log_ent_coef.continuous)
-        #     ).item(),
-        #     "Policy/Learning Rate": decay_lr,
-        # }
 
         return update_stats
 

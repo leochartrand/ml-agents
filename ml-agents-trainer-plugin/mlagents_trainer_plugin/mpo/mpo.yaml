@@ -9,19 +9,10 @@ behaviors:
       batch_size: 256 # minibatch size
       mstep_iteration_num: 1 # Number of iterations for M-Step
       evaluate_episode_maxstep: 200 # Maximum evaluate steps of an episode
-
-      # The following might not be needed
-      sample_episode_num: 30
-      sample_episode_max_steps: 200
-      sample_action_num: 64
-
-      # The rest of the parameters are what's classic for ML Agents.
-      buffer_size: 2000
+      buffer_size: 200000
       critic_learning_rate: 0.001
       actor_learning_rate: 0.001
-      num_epoch: 3
       learning_rate_schedule: linear
-      shared_critic: False
     network_settings:
       normalize: false
       hidden_units: 256

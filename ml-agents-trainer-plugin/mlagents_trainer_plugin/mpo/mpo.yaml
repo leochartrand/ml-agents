@@ -4,6 +4,7 @@ behaviors:
     hyperparameters:
       dual_constraint: 0.1
       kl_constraint: 0.01 # constraint for discrete case (M-step)
+      alpha_max: 1.0
       alpha_scale: 10.0 # scaling factor for lagrangian multiplier (M-step)
       batch_size: 256 # minibatch size
       episode_rerun_num: 3

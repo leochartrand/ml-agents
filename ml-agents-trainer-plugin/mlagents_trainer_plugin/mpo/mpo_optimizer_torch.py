@@ -87,8 +87,6 @@ class TorchMPOOptimizer(TorchOptimizer):
             MPOSettings, trainer_settings.hyperparameters
         )
 
-        print("policy.behavior_spec.observation_specs: ", policy.behavior_spec.observation_specs)
-
         self.target_policy = copy.deepcopy(self.policy)
 
         self._critic = QNetwork(
@@ -173,13 +171,18 @@ class TorchMPOOptimizer(TorchOptimizer):
         decay_critic_lr = self.decay_critic_learning_rate.get_value(self.policy.get_current_step())
         returns = {}
         old_values = {}
+        rewards =  {}
         for name in self.reward_signals:
-            old_values[name] = ModelUtils.list_to_tensor(
-                batch[RewardSignalUtil.value_estimates_key(name)]
+            rewards[name] = ModelUtils.list_to_tensor(
+                batch[RewardSignalUtil.rewards_key(name)]
             )
-            returns[name] = ModelUtils.list_to_tensor(
-                batch[RewardSignalUtil.returns_key(name)]
-            )
+            
+            # old_values[name] = ModelUtils.list_to_tensor(
+            #     batch[RewardSignalUtil.value_estimates_key(name)]
+            # )
+            # returns[name] = ModelUtils.list_to_tensor(
+            #     batch[RewardSignalUtil.returns_key(name)]
+            # )
 
         n_obs = len(self.policy.behavior_spec.observation_specs)
         current_obs = ObsUtil.from_buffer(batch, n_obs)
@@ -193,33 +196,80 @@ class TorchMPOOptimizer(TorchOptimizer):
             ModelUtils.list_to_tensor(batch[BufferKey.MEMORY][i])
             for i in range(0, len(batch[BufferKey.MEMORY]), self.policy.sequence_length)
         ]
+        if len(memories) > 0:
+            memories = torch.stack(memories).unsqueeze(0)
 
-        print('before ObsUtil.from_buffer(batch, n_obs): ', type(ObsUtil.from_buffer(batch, n_obs)))
+        # Get value memories
+        value_memories = [
+            ModelUtils.list_to_tensor(batch[BufferKey.CRITIC_MEMORY][i])
+            for i in range(
+                0, len(batch[BufferKey.CRITIC_MEMORY]), self.policy.sequence_length
+            )
+        ]
+        if len(value_memories) > 0:
+            value_memories = torch.stack(value_memories).unsqueeze(0)
 
-        state_batch = ObsUtil.from_buffer(batch, n_obs) # current_obs
-
-        print('state_batch: ', type(state_batch))
+        state_batch = [ModelUtils.list_to_tensor(obs) for obs in ObsUtil.from_buffer(batch, n_obs)]
+        # state_batch = torch.cat(state_batch, dim=1)
         action_batch = AgentAction.from_buffer(batch) # actions
-        next_state_batch = ObsUtil.from_buffer_next(batch, n_obs) # current_obs
-        reward_batch = 0 # TODO: reward
+        next_state_batch = [ModelUtils.list_to_tensor(obs) for obs in ObsUtil.from_buffer_next(batch, n_obs)]
+        # next_state_batch = torch.cat(next_state_batch, dim=1)
+        reward_batch = rewards['extrinsic']
+
+        act_masks = ModelUtils.list_to_tensor(batch[BufferKey.ACTION_MASK])
 
         K = len(action_batch.discrete_list) # Number of states, same len for actions than for states. Just simpler to use the action list here.
         # N = # TODO
         ds = self.policy.behavior_spec.observation_specs # This is a list of observations
         da = self.policy.behavior_spec.action_spec.discrete_size
-
         # Policy Evaluation
         # [2] 3 Policy Evaluation (Step 1)
 
-        loss_q, q = self.__update_critic_td(
-            state_batch = state_batch,
-            action_batch= action_batch,
-            next_state_batch= next_state_batch,
-            reward_batch= reward_batch,
-            ds=ds,
-            da=da
-        )
-# rip
+        A_eye = torch.eye(da).to(default_device())
+        # TODO: NOT TESTED FOR OUR CASE
+        B = self.hyperparameters.batch_size
+        with torch.no_grad():
+            r = reward_batch  # (B,)
+            run_out = self.target_policy.actor.get_stats(
+                next_state_batch,
+                action_batch,
+                masks=act_masks,
+                memories=memories,
+                sequence_length=self.target_policy.sequence_length,
+            )
+            π_prob = run_out["log_probs"]
+            sampled_next_actions = A_eye[None, ...].expand(B, -1, -1)  # (B, da, da)
+            expanded_next_states = next_state_batch
+            for index, state in enumerate(expanded_next_states):
+                state = state[:, None, :].expand(-1, da, -1).reshape(-1, ds[index].shape[0])  # (B, da, ds)
+
+            
+            expected_next_q, _ = self.target_critic.critic_pass(
+                    expanded_next_states,  # (B * da, ds)
+                    # sampled_next_actions.reshape(-1, da),  # (B * da, da)
+                    memories=value_memories,
+                    sequence_length=self.target_policy.sequence_length,
+                )
+            print("expected_next_q.type: ", type(expected_next_q))
+            print("π_prob (disc tensor): ", π_prob.discrete_tensor.shape)
+            print("π_prob (tensor): ", π_prob.all_discrete_tensor.shape)
+            print("π_prob (flat): ", π_prob.flatten().shape)
+            for value in expected_next_q.values():
+                print("value: ", value.shape)
+                value = value.reshape(B, da*da)
+                value = value * π_prob
+                value = value.sum(dim=-1)
+
+            y = r + self.γ * expected_next_q
+        self.critic_optimizer.zero_grad()
+        t = self.critic(
+            state_batch,
+            A_eye[action_batch.long()]
+        ).squeeze(-1)  # (B,)
+        loss = self.norm_loss_q(y, t)
+        loss.backward()
+        self.critic_optimizer.step()
+
         # E-Step of Policy Improvement
         # [2] 4.1 Finding action weights (Step 2)
         A_eye = torch.eye(da).to(default_device())
@@ -264,10 +314,7 @@ class TorchMPOOptimizer(TorchOptimizer):
                 qij * π.expand((da, K)).log_prob(actions)
             )
 
-            mean_loss_p.append((-loss_p).item())
-
             kl = categorical_kl(p1=π_p, p2=b_p)
-            max_kl.append(kl.item())
 
             if np.isnan(kl.item()):  # This should not happen
                 raise RuntimeError('kl is nan')
@@ -283,7 +330,6 @@ class TorchMPOOptimizer(TorchOptimizer):
             self.actor_optimizer.zero_grad()
             # last eq of [2] p.5
             loss_l = -(loss_p + self.α * (self.ε_kl - kl))
-            mean_loss_l.append(loss_l.item())
             loss_l.backward()
             clip_grad_norm_(self.actor.parameters(), 0.1)
             self.actor_optimizer.step()
@@ -471,11 +517,12 @@ class QNetwork(nn.Module, Actor, Critic):
     def critic_pass(
         self,
         inputs: List[torch.Tensor],
+        actions: Optional[torch.Tensor] = None,
         memories: Optional[torch.Tensor] = None,
         sequence_length: int = 1,
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         value_outputs, critic_mem_out = self.network_body(
-            inputs, memories=memories, sequence_length=sequence_length
+            inputs, actions, memories=memories, sequence_length=sequence_length
         )
         return value_outputs, critic_mem_out
 
@@ -490,8 +537,6 @@ class QNetwork(nn.Module, Actor, Critic):
         memories: Optional[torch.Tensor] = None,
         sequence_length: int = 1,
     ) -> Tuple[Union[int, torch.Tensor], ...]:
-        logger.debug('MAB: forward')
-
         out_vals, memories = self.critic_pass(inputs, memories, sequence_length)
         export_out = [self.version_number, self.memory_size_vector]
 

@@ -99,7 +99,7 @@ class TorchOptimizer(Optimizer):
             for _obs in tensor_obs:
                 seq_obs.append(_obs[start:end])
             values, _mem = self.critic.critic_pass(
-                seq_obs, _mem, sequence_length=self.policy.sequence_length
+                seq_obs, memories=_mem, sequence_length=self.policy.sequence_length
             )
             for signal_name, _val in values.items():
                 all_values[signal_name].append(_val)
@@ -195,7 +195,7 @@ class TorchOptimizer(Optimizer):
         self.critic_memory_dict[agent_id] = next_memory
 
         next_value_estimate, _ = self.critic.critic_pass(
-            next_obs, next_memory, sequence_length=1
+            next_obs, memories=next_memory, sequence_length=1
         )
 
         for name, estimate in value_estimates.items():

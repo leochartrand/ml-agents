@@ -247,6 +247,8 @@ class NetworkBody(nn.Module):
         else:
             encoding = self._body_endoder(encoded_self)
 
+        
+
         if self.use_lstm:
             # Resize to (batch, sequence length, encoding size)
             encoding = encoding.reshape([-1, sequence_length, self.h_size])
@@ -488,11 +490,12 @@ class BranchValueNetwork(nn.Module, Critic):
     def critic_pass(
         self,
         inputs: List[torch.Tensor],
+        actions: Optional[torch.Tensor] = None,
         memories: Optional[torch.Tensor] = None,
         sequence_length: int = 1,
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         value_outputs, critic_mem_out = self.forward(
-            inputs, memories=memories, sequence_length=sequence_length
+            inputs, actions, memories=memories, sequence_length=sequence_length
         )
         return value_outputs, critic_mem_out
 

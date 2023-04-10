@@ -4,7 +4,7 @@
 # Output Artifacts
 /results
 # Output Builds
-/Builds
+# /Builds
 
 # Training environments
 /envs
@@ -44,7 +44,7 @@
 *.unitypackage
 *.app
 *.exe
-*.x86_64
+# *.x86_64
 *.x86
 
 # Plugins

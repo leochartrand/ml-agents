@@ -170,6 +170,8 @@ class TorchMPOOptimizer(TorchOptimizer):
         ds = self.policy.behavior_spec.observation_specs # This is a list of observations
         da = self.policy.behavior_spec.action_spec.discrete_size
         
+        # https://github.com/daisatojp/mpo
+
         # Policy Evaluation
         with torch.no_grad():
             run_out = self.target_policy.actor.get_stats(

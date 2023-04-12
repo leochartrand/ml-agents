@@ -169,7 +169,7 @@ class TorchMPOOptimizer(TorchOptimizer):
 
         ds = self.policy.behavior_spec.observation_specs # This is a list of observations
         da = self.policy.behavior_spec.action_spec.discrete_size
-        
+
         # https://github.com/daisatojp/mpo
 
         # Policy Evaluation
@@ -181,7 +181,7 @@ class TorchMPOOptimizer(TorchOptimizer):
                 memories=memories,
                 sequence_length=self.target_policy.sequence_length,
             )
-            target_next_π_prob = run_out["log_probs"].discrete_tensor.exp() 
+            target_next_π_prob = run_out["log_probs"].discrete_tensor.exp()
             expanded_next_states = next_state_batch
             for index, state in enumerate(expanded_next_states):
                 state = state[:, None, :].expand(-1, da, -1).reshape(-1, ds[index].shape[0])
@@ -192,8 +192,8 @@ class TorchMPOOptimizer(TorchOptimizer):
                 sequence_length=self.target_policy.sequence_length,
             )
 
-            expected_next_q = torch.gather(expected_next_q['extrinsic'], 2, action_batch.discrete_tensor.unsqueeze(-1)).squeeze() 
-            expected_next_q = expected_next_q * target_next_π_prob 
+            expected_next_q = torch.gather(expected_next_q['extrinsic'], 2, action_batch.discrete_tensor.unsqueeze(-1)).squeeze()
+            expected_next_q = expected_next_q * target_next_π_prob
             expected_next_q = expected_next_q.sum(dim=-1)
 
             y = reward_batch + self.γ * expected_next_q
@@ -204,7 +204,7 @@ class TorchMPOOptimizer(TorchOptimizer):
             sequence_length=self.policy.sequence_length,
         )
 
-        t = torch.gather(t['extrinsic'], 2, action_batch.discrete_tensor.unsqueeze(-1)).squeeze().sum(dim=-1) 
+        t = torch.gather(t['extrinsic'], 2, action_batch.discrete_tensor.unsqueeze(-1)).squeeze().sum(dim=-1)
         loss = self.norm_loss_q(y, t)
         loss.backward()
         self.critic_optimizer.step()
@@ -218,7 +218,7 @@ class TorchMPOOptimizer(TorchOptimizer):
                 memories=memories,
                 sequence_length=self.target_policy.sequence_length,
             )
-            target_π_prob = run_out["log_probs"].discrete_tensor.exp() 
+            target_π_prob = run_out["log_probs"].discrete_tensor.exp()
 
             expanded_states = state_batch
             for index, state in enumerate(expanded_states):
@@ -255,7 +255,7 @@ class TorchMPOOptimizer(TorchOptimizer):
                 masks=act_masks,
                 memories=memories,
                 sequence_length=self.target_policy.sequence_length,
-            ) 
+            )
             π_log_probs = run_out["log_probs"].discrete_tensor
             loss_p = torch.mean(
                 qij * π_log_probs
@@ -265,7 +265,7 @@ class TorchMPOOptimizer(TorchOptimizer):
 
             kl = categorical_kl(p1=π_p, p2=target_π_prob)
 
-            if np.isnan(kl.item()): 
+            if np.isnan(kl.item()):
                 raise RuntimeError('kl is nan')
 
             self.α -= self.α_scale * (self.ε_kl - kl).detach().item()
@@ -283,6 +283,7 @@ class TorchMPOOptimizer(TorchOptimizer):
             # TODO: After PyTorch is default, change to something more correct.
             "Losses/loss_p": torch.abs(loss_p).item(),
             "Losses/Policy Loss": torch.abs(loss_l).item(),
+            "Losses/loss": torch.abs(loss).item(),
         }
 
         return update_stats

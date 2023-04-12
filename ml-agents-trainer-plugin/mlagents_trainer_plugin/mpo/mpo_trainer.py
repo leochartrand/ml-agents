@@ -107,8 +107,7 @@ class MPOTrainer(OffPolicyTrainer):
 
         # Evaluate all reward functions
         self.collected_rewards["environment"][agent_id] += np.sum(
-            agent_buffer_trajectory[BufferKey.ENVIRONMENT_REWARDS]
-        )
+            agent_buffer_trajectory[BufferKey.ENVIRONMENT_REWARDS]) + np.sum(agent_buffer_trajectory[BufferKey.GROUP_REWARD])
         for name, reward_signal in self.optimizer.reward_signals.items():
             evaluate_result = (
                 reward_signal.evaluate(agent_buffer_trajectory) * reward_signal.strength
